@@ -65,7 +65,7 @@ import (
 //        return nil
 //    })
 //
-func ExecuteTx(ctx context.Context, db *sqlx.DB, txopts *sqlx.TxOptions, fn func(*sqlx.Tx) error) error {
+func ExecuteTxx(ctx context.Context, db *sqlx.DB, txopts *sqlx.TxOptions, fn func(*sqlx.Tx) error) error {
 	// Start a transaction.
 	tx, err := db.BeginTxx(ctx, txopts)
 	if err != nil {
@@ -75,7 +75,7 @@ func ExecuteTx(ctx context.Context, db *sqlx.DB, txopts *sqlx.TxOptions, fn func
 }
 
 // Tx is used to permit clients to implement custom transaction logic.
-type Tx interface {
+type Txx interface {
 	ExecContext(context.Context, string, ...interface{}) (sql.Result, error)
 	Commit() error
 	Rollback() error
@@ -88,20 +88,20 @@ type Tx interface {
 // be re-run if the transaction needs to be retried.
 //
 // fn is subject to the same restrictions as the fn passed to ExecuteTx.
-func ExecuteInTx(ctx context.Context, tx Tx, fn func() error) (err error) {
+func ExecuteInTxx(ctx context.Context, txx Txx, fn func() error) (err error) {
 	defer func() {
 		if err == nil {
 			// Ignore commit errors. The tx has already been committed by RELEASE.
-			_ = tx.Commit()
+			_ = txx.Commit()
 		} else {
 			// We always need to execute a Rollback() so sql.DB releases the
 			// connection.
-			_ = tx.Rollback()
+			_ = txx.Rollback()
 		}
 	}()
 	// Specify that we intend to retry this txn in case of CockroachDB retryable
 	// errors.
-	if _, err = tx.ExecContext(ctx, "SAVEPOINT cockroach_restart"); err != nil {
+	if _, err = txx.ExecContext(ctx, "SAVEPOINT cockroach_restart"); err != nil {
 		return err
 	}
 
@@ -112,7 +112,7 @@ func ExecuteInTx(ctx context.Context, tx Tx, fn func() error) (err error) {
 			// RELEASE acts like COMMIT in CockroachDB. We use it since it gives us an
 			// opportunity to react to retryable errors, whereas tx.Commit() doesn't.
 			released = true
-			if _, err = tx.ExecContext(ctx, "RELEASE SAVEPOINT cockroach_restart"); err == nil {
+			if _, err = txx.ExecContext(ctx, "RELEASE SAVEPOINT cockroach_restart"); err == nil {
 				return nil
 			}
 		}
@@ -127,7 +127,7 @@ func ExecuteInTx(ctx context.Context, tx Tx, fn func() error) (err error) {
 			}
 			return err
 		}
-		if _, retryErr := tx.ExecContext(ctx, "ROLLBACK TO SAVEPOINT cockroach_restart"); retryErr != nil {
+		if _, retryErr := txx.ExecContext(ctx, "ROLLBACK TO SAVEPOINT cockroach_restart"); retryErr != nil {
 			return newTxnRestartError(retryErr, err)
 		}
 	}
