@@ -65,7 +65,7 @@ import (
 //        return nil
 //    })
 //
-func ExecuteTxx(ctx context.Context, db *sqlx.DB, txopts *sqlx.TxOptions, fn func(*sqlx.Tx) error) error {
+func ExecuteTxx(ctx context.Context, db *sqlx.DB, txopts *sql.TxOptions, fn func(*sqlx.Tx) error) error {
 	// Start a transaction.
 	tx, err := db.BeginTxx(ctx, txopts)
 	if err != nil {
