@@ -21,10 +21,9 @@ import (
 	"database/sql"
 
 	"github.com/jmoiron/sqlx"
-	"github.com/lib/pq"
 )
 
-// ExecuteTx runs fn inside a transaction and retries it as needed.
+// ExecuteTxx runs fn inside a transaction and retries it as needed.
 // On non-retryable failures, the transaction is aborted and rolled
 // back; on success, the transaction is committed.
 // There are cases where the state of a transaction is inherently ambiguous: if
@@ -65,43 +64,45 @@ import (
 //        return nil
 //    })
 //
-func ExecuteTxx(ctx context.Context, db *sqlx.DB, txopts *sql.TxOptions, fn func(*sqlx.Tx) error) error {
+func ExecuteTxx(
+	ctx context.Context, db *sqlx.DB, txopts *sql.TxOptions, fn func(*sqlx.Tx) error,
+) error {
 	// Start a transaction.
 	tx, err := db.BeginTxx(ctx, txopts)
 	if err != nil {
 		return err
 	}
-	return ExecuteInTx(ctx, tx, func() error { return fn(tx) })
+	return ExecuteInTxx(ctx, tx, func() error { return fn(tx) })
 }
 
-// Tx is used to permit clients to implement custom transaction logic.
+// Txx is used to permit clients to implement custom transaction logic.
 type Txx interface {
 	ExecContext(context.Context, string, ...interface{}) (sql.Result, error)
 	Commit() error
 	Rollback() error
 }
 
-// ExecuteInTx runs fn inside tx which should already have begun.
+// ExecuteInTxx runs fn inside tx which should already have begun.
 // *WARNING*: Do not execute any statements on the supplied tx before calling this function.
 // ExecuteInTx will only retry statements that are performed within the supplied
 // closure (fn). Any statements performed on the tx before ExecuteInTx is invoked will *not*
 // be re-run if the transaction needs to be retried.
 //
 // fn is subject to the same restrictions as the fn passed to ExecuteTx.
-func ExecuteInTxx(ctx context.Context, txx Txx, fn func() error) (err error) {
+func ExecuteInTxx(ctx context.Context, tx Txx, fn func() error) (err error) {
 	defer func() {
 		if err == nil {
 			// Ignore commit errors. The tx has already been committed by RELEASE.
-			_ = txx.Commit()
+			_ = tx.Commit()
 		} else {
 			// We always need to execute a Rollback() so sql.DB releases the
 			// connection.
-			_ = txx.Rollback()
+			_ = tx.Rollback()
 		}
 	}()
 	// Specify that we intend to retry this txn in case of CockroachDB retryable
 	// errors.
-	if _, err = txx.ExecContext(ctx, "SAVEPOINT cockroach_restart"); err != nil {
+	if _, err = tx.ExecContext(ctx, "SAVEPOINT cockroach_restart"); err != nil {
 		return err
 	}
 
@@ -112,22 +113,25 @@ func ExecuteInTxx(ctx context.Context, txx Txx, fn func() error) (err error) {
 			// RELEASE acts like COMMIT in CockroachDB. We use it since it gives us an
 			// opportunity to react to retryable errors, whereas tx.Commit() doesn't.
 			released = true
-			if _, err = txx.ExecContext(ctx, "RELEASE SAVEPOINT cockroach_restart"); err == nil {
+			if _, err = tx.ExecContext(ctx, "RELEASE SAVEPOINT cockroach_restart"); err == nil {
 				return nil
 			}
 		}
-		// We got an error; let's see if it's a retryable one and, if so, restart. We look
-		// for either the standard PG errcode SerializationFailureError:40001 or the Cockroach extension
-		// errcode RetriableError:CR000. The Cockroach extension has been removed server-side, but support
-		// for it has been left here for now to maintain backwards compatibility.
-		pqErr, ok := errorCause(err).(*pq.Error)
-		if retryable := ok && (pqErr.Code == "CR000" || pqErr.Code == "40001"); !retryable {
+		// We got an error; let's see if it's a retryable one and, if so, restart.
+		// We look for either:
+		//  - the standard PG errcode SerializationFailureError:40001 or
+		//  - the Cockroach extension errcode RetriableError:CR000. This extension
+		//    has been removed server-side, but support for it has been left here for
+		//    now to maintain backwards compatibility.
+		code := errCode(err)
+		if retryable := (code == "CR000" || code == "40001"); !retryable {
 			if released {
 				err = newAmbiguousCommitError(err)
 			}
 			return err
 		}
-		if _, retryErr := txx.ExecContext(ctx, "ROLLBACK TO SAVEPOINT cockroach_restart"); retryErr != nil {
+
+		if _, retryErr := tx.ExecContext(ctx, "ROLLBACK TO SAVEPOINT cockroach_restart"); retryErr != nil {
 			return newTxnRestartError(retryErr, err)
 		}
 	}
